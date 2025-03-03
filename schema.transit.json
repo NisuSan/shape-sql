@@ -1,0 +1,22 @@
+{
+    "source": {
+      "connection": "mysql://user:pass@localhost/source_db",
+      "tables": [{"name": "users", "where": {"created_at": [">=", "2020-01-01"]}}]
+    },
+    "mappings": [
+      {
+        "connection": "postgresql://user:pass@localhost/pg_db",
+        "tables": [
+          {
+            "source_table": "users",
+            "target_table": "pg_users",
+            "columns": [
+              ["id", "user_id"],
+              ["name", "name", "to_lowercase"],
+              ["created_at", "created", ["normalize_timestamp", "trim"]]
+            ]
+          }
+        ]
+      }
+    ]
+  }
