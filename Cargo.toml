@@ -1,0 +1,17 @@
+[package]
+name = "shape-sql"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "fs", "io-util", "macros"] }
+sqlx = { version = "0.8.3", features = ["runtime-tokio", "tls-rustls", "mysql", "postgres", "chrono", "json"] }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.120"
+anyhow = "1.0.90"
+sysinfo = "0.33.1"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.18"
+jsonschema = "0.29.0"
+async-compression = { version = "0.4", features = ["gzip", "tokio"] }
+futures-util = "0.3"
