@@ -1,23 +1,98 @@
 use anyhow::{Result, Context};
+use clap::{Parser, Subcommand};
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use ini::Ini;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use sqlx::{Pool, Row, any::AnyRow};
+use sqlx::{Pool, Row, any::AnyRow, Column};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
+use std::fs;
 use tokio::fs::File as TokioFile;
 use tokio::io::{BufWriter, AsyncWriteExt};
 use async_compression::tokio::write::GzipEncoder;
 use sysinfo::System;
 use tracing::{info, warn, error};
-use futures_util::stream::StreamExt;
-use jsonschema;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::filter::EnvFilter;
 
+/// CLI arguments using clap.
+#[derive(Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Dump the source database to SQL file(s).
+    Dump {
+        /// Shape file name (without the .shape.json extension)
+        name: String,
+    },
+    /// Restore the source database from dump file(s).
+    Restore {
+        /// Shape file name (without the .shape.json extension)
+        name: String,
+    },
+    /// Run migration according to the shape file.
+    /// If mappings exist, performs migration; otherwise, performs a dump.
+    Run {
+        /// Shape file name (without the .shape.json extension)
+        name: String,
+    },
+}
+
+/// Holds directories for shapes, dumps and logs from config.ini.
+struct ConfigPaths {
+    shapes: String,
+    dumps: String,
+    logs: String,
+}
+
+impl ConfigPaths {
+    fn load_from_file(path: &str) -> Result<Self> {
+        let conf = Ini::load_from_file(path)
+            .context("Failed to load config.ini")?;
+        // Use the general (default) section.
+        let section = conf.general_section();
+        let shapes = section.get::<&str>("shapes").unwrap_or("shapes").to_string();
+        let dumps = section.get::<&str>("dumps").unwrap_or("dumps").to_string();
+        let logs = section.get::<&str>("logs").unwrap_or("logs").to_string();
+        Ok(ConfigPaths { shapes, dumps, logs })
+    }
+}
+
+/// Initializes logging with two layers: one writing to stdout and one writing to a daily rotated log file.
+fn init_logging(logs_dir: &str) -> tracing_appender::non_blocking::WorkerGuard {
+    use tracing_appender::rolling::daily;
+    let file_appender = daily(logs_dir, "application.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+    let console_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+    let file_layer = tracing_subscriber::fmt::layer().with_writer(file_writer);
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(file_layer)
+        .with(EnvFilter::from_default_env())
+        .init();
+    guard
+}
+
+/// Shape file format.
+/// New properties:
+/// - compress: if true, dump files are gzipped.
+/// - split_dump: if true, each table is dumped into its own SQL file.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Config {
+struct ConfigShape {
     source: SourceConfig,
-    mappings: Vec<Mapping>,
+    /// Optional mappings for migration. If missing or empty, dump/restore operations are performed.
+    mappings: Option<Vec<Mapping>>,
     #[serde(default)]
     compress: bool,
+    #[serde(default)]
+    split_dump: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -39,8 +114,8 @@ struct Mapping {
     tables: Vec<MappingTable>,
 }
 
-/// The transit file defines columns as arrays (e.g. ["id", "user_id"] or ["created_at", "created", ["normalize_timestamp", "trim"]]).
-/// We implement a custom deserializer for ColumnMapping to support that format.
+/// Column mapping is defined as an array in the shape file:
+/// e.g. ["id", "user_id"] or ["created_at", "created", ["normalize_timestamp", "trim"]]
 #[derive(Debug, Serialize, Clone, PartialEq)]
 struct ColumnMapping {
     source: String,
@@ -132,7 +207,6 @@ impl TransformerType {
         match self {
             TransformerType::NormalizeTimestamp => {
                 if let JsonValue::String(ts) = value {
-                    // Replace with proper datetime conversion logic as needed.
                     Ok(JsonValue::String(format!("normalized_{}", ts)))
                 } else {
                     Err(anyhow::anyhow!("Expected string for timestamp, got {:?}", value))
@@ -174,8 +248,9 @@ enum Writer {
     Compressed(GzipEncoder<BufWriter<TokioFile>>),
 }
 
+/// Migrator for mapping operations.
 struct Migrator {
-    config: Config,
+    config: ConfigShape,
     transformers: HashMap<String, TransformerType>,
     source_pool: Pool<sqlx::Any>,
     source_type: DbType,
@@ -183,9 +258,7 @@ struct Migrator {
 }
 
 impl Migrator {
-    async fn new(config: Config) -> Result<Self> {
-        tracing_subscriber::fmt::init();
-
+    async fn new(config: ConfigShape) -> Result<Self> {
         let transformers = HashMap::from([
             ("normalize_timestamp".to_string(), TransformerType::NormalizeTimestamp),
             ("to_lowercase".to_string(), TransformerType::ToLowercase),
@@ -200,15 +273,17 @@ impl Migrator {
             .context("Failed to connect to source database")?;
 
         let mut target_pools = HashMap::new();
-        let mut unique_connections = HashSet::new();
-        for mapping in &config.mappings {
-            if unique_connections.insert(mapping.connection.clone()) {
-                let db_type = DbType::from_connection_string(&mapping.connection)?;
-                let pool = sqlx::any::AnyPoolOptions::new()
-                    .connect(&mapping.connection)
-                    .await
-                    .context(format!("Failed to connect to target '{}'", mapping.connection))?;
-                target_pools.insert(mapping.connection.clone(), (db_type, pool));
+        if let Some(mappings) = &config.mappings {
+            let mut unique_connections = HashSet::new();
+            for mapping in mappings {
+                if unique_connections.insert(mapping.connection.clone()) {
+                    let db_type = DbType::from_connection_string(&mapping.connection)?;
+                    let pool = sqlx::any::AnyPoolOptions::new()
+                        .connect(&mapping.connection)
+                        .await
+                        .context(format!("Failed to connect to target '{}'", mapping.connection))?;
+                    target_pools.insert(mapping.connection.clone(), (db_type, pool));
+                }
             }
         }
 
@@ -220,49 +295,27 @@ impl Migrator {
             target_pools,
         };
 
-        migrator.apply_or_suggest_transformers().await?;
-        for mapping in &migrator.config.mappings {
-            if let Some((_, pool)) = migrator.target_pools.get(&mapping.connection) {
-                for table in &mapping.tables {
-                    migrator.validate_target_schema(pool, table).await?;
+        if let Some(mappings) = &migrator.config.mappings {
+            for mapping in mappings {
+                if let Some((_, pool)) = migrator.target_pools.get(&mapping.connection) {
+                    for table in &mapping.tables {
+                        migrator.validate_target_schema(pool, table).await?;
+                    }
+                } else {
+                    warn!("Target pool not initialized for '{}'", mapping.connection);
                 }
-            } else {
-                warn!("Target pool not initialized for '{}'", mapping.connection);
             }
         }
 
         Ok(migrator)
     }
 
-    async fn apply_or_suggest_transformers(&self) -> Result<()> {
-        let mut config = self.config.clone();
-        for mapping in &mut config.mappings {
-            for table in &mut mapping.tables {
-                let _sample = self.sample_data(&table.source_table).await;
-                for col in &mut table.columns {
-                    if col.transformers.is_empty() {
-                        info!(
-                            "No transformers provided for {}.{}; automatic type-based conversion will be applied if needed.",
-                            table.source_table, col.source
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn sample_data(&self, table: &str) -> Vec<AnyRow> {
-        let query = format!("SELECT * FROM {} LIMIT 100", table);
-        sqlx::query(&query).fetch_all(&self.source_pool).await.unwrap_or_default()
-    }
-
     async fn validate_target_schema(&self, pool: &Pool<sqlx::Any>, mapping: &MappingTable) -> Result<()> {
-        let target_type = DbType::from_connection_string(
-            &self.config.mappings.iter()
-                .find(|m| m.tables.contains(mapping))
-                .unwrap().connection
-        )?;
+        let target_type = if let Some(mappings) = &self.config.mappings {
+            DbType::from_connection_string(&mappings[0].connection)?
+        } else {
+            self.source_type.clone()
+        };
         let query = match target_type {
             DbType::MySql => format!(
                 "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}'",
@@ -364,18 +417,18 @@ impl Migrator {
         (query, params)
     }
 
-    /// Helper function that tries to extract a column's value from a row by attempting multiple types.
+    /// Helper: Try to extract a column's value from a row by trying several types.
     fn value_to_json_from_row(row: &AnyRow, col: &str) -> Result<JsonValue> {
-        if let Ok(i) = row.try_get::<i64, _>(col) {
+        if let Ok(i) = row.try_get::<i64, &str>(col) {
             return Ok(json!(i));
         }
-        if let Ok(f) = row.try_get::<f64, _>(col) {
+        if let Ok(f) = row.try_get::<f64, &str>(col) {
             return Ok(json!(f));
         }
-        if let Ok(s) = row.try_get::<String, _>(col) {
+        if let Ok(s) = row.try_get::<String, &str>(col) {
             return Ok(json!(s));
         }
-        if let Ok(b) = row.try_get::<Vec<u8>, _>(col) {
+        if let Ok(b) = row.try_get::<Vec<u8>, &str>(col) {
             if let Ok(s) = std::str::from_utf8(&b) {
                 return Ok(json!(s));
             } else {
@@ -385,9 +438,7 @@ impl Migrator {
         Ok(JsonValue::Null)
     }
 
-    /// Converts each column's value into a JsonValue using the helper above.
-    /// Then applies user-specified transformers or, if none are provided and the source and target DB types differ,
-    /// applies automatic type-based transformation.
+    /// Applies transformers (or automatic conversion) to each column in a mapping.
     fn transform_row(
         row: &AnyRow,
         mapping: &MappingTable,
@@ -406,7 +457,6 @@ impl Migrator {
                         .transform(value)?;
                 }
             } else if source_type != target_type {
-                // Apply automatic transformation based solely on the value's type.
                 value = auto_transform(value, source_type.clone(), target_type.clone())?;
             }
             data.insert(col.target.clone(), value);
@@ -414,15 +464,15 @@ impl Migrator {
         Ok(data)
     }
 
+    /// Runs migration: if mappings exist, applies migration logic; otherwise, dumps source.
     async fn run(&self) -> Result<()> {
-        let (tx, rx) = mpsc::channel::<(String, String, Vec<RowData>)>(100);
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, String, Vec<RowData>)>(100);
 
-        // For each source table, process and dispatch batches per target mapping.
         for table in &self.config.source.tables {
             let tx = tx.clone();
             let source_pool = self.source_pool.clone();
             let source_table_config = table.clone();
-            let mappings = self.config.mappings.clone();
+            let mappings = if let Some(m) = &self.config.mappings { m.clone() } else { vec![] };
             let transformers = self.transformers.clone();
             let chunk_size = Self::calculate_chunk_size(None);
             let source_type = self.source_type.clone();
@@ -431,7 +481,29 @@ impl Migrator {
             info!("Query for {}: {}", source_table_config.name, query);
             info!("Using chunk_size: {} for table {}", chunk_size, source_table_config.name);
 
-            // Pre-compute all target mapping configurations for this source table.
+            // If no mapping exists, dump the table's data.
+            if mappings.is_empty() {
+                let mut rows = sqlx::query(&query).fetch(&source_pool);
+                let mut batch = Vec::new();
+                while let Some(row) = rows.next().await.transpose()? {
+                    let mut row_map = RowData::new();
+                    for column in row.columns() {
+                        let col_name = column.name();
+                        let value = Self::value_to_json_from_row(&row, col_name)?;
+                        row_map.insert(col_name.to_string(), value);
+                    }
+                    batch.push(row_map);
+                    if batch.len() >= chunk_size {
+                        tx.send((self.config.source.connection.clone(), source_table_config.name.clone(), batch)).await?;
+                        batch = Vec::new();
+                    }
+                }
+                if !batch.is_empty() {
+                    tx.send((self.config.source.connection.clone(), source_table_config.name.clone(), batch)).await?;
+                }
+                continue;
+            }
+
             let mapping_configs: Vec<(String, MappingTable)> = {
                 let mut v = Vec::new();
                 for mapping in &mappings {
@@ -444,18 +516,12 @@ impl Migrator {
                 v
             };
 
-            if mapping_configs.is_empty() {
-                warn!("No mapping found for source table {}", source_table_config.name);
-                continue;
-            }
-
             tokio::spawn(async move {
                 let mut q = sqlx::query(&query);
                 for param in params {
                     q = q.bind(param);
                 }
                 let mut rows = q.fetch(&source_pool);
-                // Group batches by (target_connection, target_table)
                 let mut batches: HashMap<(String, String), Vec<RowData>> = HashMap::new();
 
                 while let Some(row) = rows.next().await.transpose()? {
@@ -479,7 +545,7 @@ impl Migrator {
                     }
                 }
 
-                Ok::<_, anyhow::Error>(())
+                Ok::<(), anyhow::Error>(())
             });
         }
 
@@ -500,19 +566,23 @@ impl Migrator {
                 }
             }
         } else {
-            let filename = if self.config.compress { "dump.sql.gz" } else { "dump.sql" };
-            let file = TokioFile::create(filename).await
-                .context(format!("Failed to create {}", filename))?;
+            // Single dump file mode.
+            let dump_filename = if self.config.compress {
+                format!("{}/{}.sql.gz", "dumps", "dump_all")
+            } else {
+                format!("{}/{}.sql", "dumps", "dump_all")
+            };
+            let file = TokioFile::create(&dump_filename).await
+                .context(format!("Failed to create dump file {}", dump_filename))?;
             let buffered_writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
             let mut writer = if self.config.compress {
                 Writer::Compressed(GzipEncoder::new(buffered_writer))
             } else {
                 Writer::Plain(buffered_writer)
             };
-
             let mut rx = rx;
             while let Some((_, target_table, batch)) = rx.recv().await {
-                self.write_batch_to_file(&mut writer, &target_table, &batch).await?;
+                Self::write_batch_to_file(&mut writer, &target_table, &batch).await?;
                 match &mut writer {
                     Writer::Plain(w) => w.flush().await?,
                     Writer::Compressed(w) => w.flush().await?,
@@ -556,29 +626,25 @@ impl Migrator {
         Ok(())
     }
 
-    async fn write_batch_to_file(&self, writer: &mut Writer, table: &str, batch: &[RowData]) -> Result<()> {
+    async fn write_batch_to_file(writer: &mut Writer, table: &str, batch: &[RowData]) -> Result<()> {
         let mut query = format!("INSERT INTO {} (", table);
         let columns: Vec<String> = batch[0].keys().cloned().collect();
         query.push_str(&columns.join(", "));
         query.push_str(") VALUES ");
-
         let mut values = Vec::new();
         for row in batch {
-            let row_values: Vec<String> = columns
-                .iter()
-                .map(|col| match &row[col] {
+            let row_values: Vec<String> = columns.iter().map(|col| {
+                match &row[col] {
                     JsonValue::Number(n) => n.to_string(),
                     JsonValue::String(s) => format!("'{}'", s.replace("'", "''")),
                     JsonValue::Bool(b) => b.to_string(),
-                    JsonValue::Object(_) | JsonValue::Array(_) => serde_json::to_string(&row[col]).unwrap_or("NULL".to_string()),
                     _ => "NULL".to_string(),
-                })
-                .collect();
+                }
+            }).collect();
             values.push(format!("({})", row_values.join(", ")));
         }
         query.push_str(&values.join(", "));
         query.push_str(";\n");
-
         match writer {
             Writer::Plain(w) => w.write_all(query.as_bytes()).await?,
             Writer::Compressed(w) => w.write_all(query.as_bytes()).await?,
@@ -601,7 +667,6 @@ impl Migrator {
         };
 
         let final_type = user_type.unwrap_or(rust_type);
-
         if let Some(user) = user_type {
             if user != rust_type {
                 let compatible = match (rust_type, user) {
@@ -618,7 +683,6 @@ impl Migrator {
                 }
             }
         }
-
         let target_db_type = target_type.unwrap_or(&self.source_type);
         match target_db_type {
             DbType::MySql => match final_type {
@@ -631,7 +695,8 @@ impl Migrator {
                 "json" => "JSON",
                 "bool" => "TINYINT(1)",
                 _ => "TEXT",
-            }.to_string(),
+            }
+            .to_string(),
             DbType::Postgres => match final_type {
                 "i32" => "INTEGER",
                 "i64" => "BIGINT",
@@ -642,14 +707,13 @@ impl Migrator {
                 "json" => "JSONB",
                 "bool" => "BOOLEAN",
                 _ => "TEXT",
-            }.to_string(),
+            }
+            .to_string(),
         }
     }
 }
 
-/// Automatically transforms a value based solely on its JSON type
-/// when the source and target databases differ. For example, if the value is a string representing a datetime,
-/// it might be reformatted.
+/// Automatically transforms a JSON value when source and target DB differ.
 fn auto_transform(value: JsonValue, source_type: DbType, target_type: DbType) -> Result<JsonValue> {
     if source_type == target_type {
         return Ok(value);
@@ -657,7 +721,6 @@ fn auto_transform(value: JsonValue, source_type: DbType, target_type: DbType) ->
     match value {
         JsonValue::String(ref s) => {
             if s.contains('-') && s.contains(':') {
-                // Replace with proper datetime conversion as needed.
                 return Ok(JsonValue::String(format!("converted_{}", s)));
             }
             Ok(value)
@@ -667,50 +730,256 @@ fn auto_transform(value: JsonValue, source_type: DbType, target_type: DbType) ->
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config_file = std::fs::read_to_string("schema.transit.json")
-        .context("Failed to read schema.transit.json")?;
-    
-    let schema = json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-        "required": ["source", "mappings"],
-        "properties": {
-            "source": {
-                "type": "object",
-                "required": ["connection", "tables"],
-                "properties": {
-                    "connection": { "type": "string" },
-                    "tables": { "type": "array" }
-                }
-            },
-            "mappings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["connection", "tables"],
-                    "properties": {
-                        "connection": { "type": "string" },
-                        "tables": { "type": "array" }
+/// Dumps the source database to SQL file(s).
+/// If split_dump is true, creates one file per table; otherwise, creates one combined file.
+async fn dump_shape(config: &ConfigShape, paths: &ConfigPaths, shape_name: &str) -> Result<()> {
+    let pool = sqlx::any::AnyPoolOptions::new()
+        .connect(&config.source.connection)
+        .await
+        .context("Failed to connect to source database")?;
+    if config.split_dump {
+        let mut tasks = FuturesUnordered::new();
+        for table in &config.source.tables {
+            let pool = pool.clone();
+            let table = table.clone();
+            let dumps_dir = paths.dumps.clone();
+            let compress = config.compress;
+            let shape_name = shape_name.to_string();
+            tasks.push(tokio::spawn(async move {
+                dump_table(&table, pool, &dumps_dir, &shape_name, compress).await
+            }));
+        }
+        while let Some(res) = tasks.next().await {
+            res??;
+        }
+    } else {
+        let chunk_size = 1000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<RowData>)>(100);
+        for table in &config.source.tables {
+            let tx = tx.clone();
+            let query = format!("SELECT * FROM {}", table.name);
+            let pool = pool.clone();
+            let table_name = table.name.clone();
+            tokio::spawn(async move {
+                let mut rows = sqlx::query(&query).fetch(&pool);
+                let mut batch = Vec::new();
+                while let Some(row) = rows.next().await.transpose()? {
+                    let mut row_map = RowData::new();
+                    for column in row.columns() {
+                        let col_name = column.name();
+                        let value = Migrator::value_to_json_from_row(&row, col_name)?;
+                        row_map.insert(col_name.to_string(), value);
+                    }
+                    batch.push(row_map);
+                    if batch.len() >= chunk_size {
+                        tx.send((table_name.clone(), batch)).await?;
+                        batch = Vec::new();
                     }
                 }
-            },
-            "compress": { "type": "boolean" }
+                if !batch.is_empty() {
+                    tx.send((table_name.clone(), batch)).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
         }
-    });
-
-    let config_json: serde_json::Value = serde_json::from_str(&config_file)?;
-    if jsonschema::validate(&schema, &config_json).is_err() {
-        return Err(anyhow::anyhow!("Invalid schema.transit.json"));
+        drop(tx);
+        let dump_filename = if config.compress {
+            format!("{}/{}.sql.gz", paths.dumps, shape_name)
+        } else {
+            format!("{}/{}.sql", paths.dumps, shape_name)
+        };
+        let file = TokioFile::create(&dump_filename).await
+            .context(format!("Failed to create dump file {}", dump_filename))?;
+        let buffered_writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let mut writer = if config.compress {
+            Writer::Compressed(GzipEncoder::new(buffered_writer))
+        } else {
+            Writer::Plain(buffered_writer)
+        };
+        while let Some((table_name, batch)) = rx.recv().await {
+            let stmt = generate_insert_statement(&table_name, &batch)?;
+            match &mut writer {
+                Writer::Plain(w) => w.write_all(stmt.as_bytes()).await?,
+                Writer::Compressed(w) => w.write_all(stmt.as_bytes()).await?,
+            }
+        }
+        match &mut writer {
+            Writer::Plain(w) => w.flush().await?,
+            Writer::Compressed(w) => w.flush().await?,
+        }
+        info!("Dumped source database to {}", dump_filename);
     }
+    Ok(())
+}
 
-    let config: Config = serde_json::from_str(&config_file)
-        .context("Failed to parse schema.transit.json")?;
+/// Dumps a single table to its own SQL file.
+async fn dump_table(
+    table: &TableConfig,
+    pool: Pool<sqlx::Any>,
+    dumps_dir: &str,
+    shape_name: &str,
+    compress: bool,
+) -> Result<()> {
+    let chunk_size = 1000;
+    let query = format!("SELECT * FROM {}", table.name);
+    let mut rows = sqlx::query(&query).fetch(&pool);
+    let mut batch = Vec::new();
+    let mut sql_statements = String::new();
+    while let Some(row) = rows.next().await.transpose()? {
+        let mut row_map = RowData::new();
+        for column in row.columns() {
+            let col_name = column.name();
+            let value = Migrator::value_to_json_from_row(&row, col_name)?;
+            row_map.insert(col_name.to_string(), value);
+        }
+        batch.push(row_map);
+        if batch.len() >= chunk_size {
+            sql_statements.push_str(&generate_insert_statement(&table.name, &batch)?);
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        sql_statements.push_str(&generate_insert_statement(&table.name, &batch)?);
+    }
+    let dump_filename = if compress {
+        format!("{}/{}_{}.sql.gz", dumps_dir, shape_name, table.name)
+    } else {
+        format!("{}/{}_{}.sql", dumps_dir, shape_name, table.name)
+    };
+    let file = TokioFile::create(&dump_filename).await
+        .context(format!("Failed to create dump file {}", dump_filename))?;
+    let mut writer = if compress {
+        Writer::Compressed(GzipEncoder::new(BufWriter::new(file)))
+    } else {
+        Writer::Plain(BufWriter::new(file))
+    };
+    match &mut writer {
+        Writer::Plain(w) => w.write_all(sql_statements.as_bytes()).await?,
+        Writer::Compressed(w) => w.write_all(sql_statements.as_bytes()).await?,
+    }
+    match &mut writer {
+        Writer::Plain(w) => w.flush().await?,
+        Writer::Compressed(w) => w.flush().await?,
+    }
+    info!("Dumped table {} to {}", table.name, dump_filename);
+    Ok(())
+}
 
-    let migrator = Migrator::new(config).await?;
-    migrator.run().await?;
+/// Generates an INSERT statement from a batch of rows.
+fn generate_insert_statement(table: &str, batch: &[RowData]) -> Result<String> {
+    if batch.is_empty() {
+        return Ok(String::new());
+    }
+    let columns: Vec<String> = batch[0].keys().cloned().collect();
+    let mut stmt = format!("INSERT INTO {} ({}) VALUES ", table, columns.join(", "));
+    let mut values = Vec::new();
+    for row in batch {
+        let row_values: Vec<String> = columns.iter().map(|col| {
+            match &row[col] {
+                JsonValue::Number(n) => n.to_string(),
+                JsonValue::String(s) => format!("'{}'", s.replace("'", "''")),
+                JsonValue::Bool(b) => b.to_string(),
+                _ => "NULL".to_string(),
+            }
+        }).collect();
+        values.push(format!("({})", row_values.join(", ")));
+    }
+    stmt.push_str(&values.join(", "));
+    stmt.push_str(";\n");
+    Ok(stmt)
+}
 
-    info!("Migration or dump completed successfully!");
+/// Restores the source database from dump file(s).
+async fn restore_shape(config: &ConfigShape, paths: &ConfigPaths, shape_name: &str) -> Result<()> {
+    if config.split_dump {
+        for table in &config.source.tables {
+            let dump_filename = if config.compress {
+                format!("{}/{}_{}.sql.gz", paths.dumps, shape_name, table.name)
+            } else {
+                format!("{}/{}_{}.sql", paths.dumps, shape_name, table.name)
+            };
+            let dump_data = if config.compress {
+                fs::read(&dump_filename).context(format!("Failed to read gz dump file {}", dump_filename))?
+            } else {
+                fs::read(&dump_filename).context(format!("Failed to read dump file {}", dump_filename))?
+            };
+            let dump_str = String::from_utf8(dump_data).context("Dump file is not valid UTF-8")?;
+            let pool = sqlx::any::AnyPoolOptions::new()
+                .connect(&config.source.connection)
+                .await
+                .context("Failed to connect to source database")?;
+            for stmt in dump_str.split(';') {
+                let stmt = stmt.trim();
+                if !stmt.is_empty() {
+                    sqlx::query(stmt).execute(&pool).await?;
+                }
+            }
+            info!("Restored table {} from {}", table.name, dump_filename);
+        }
+    } else {
+        let dump_filename = if config.compress {
+            format!("{}/{}.sql.gz", paths.dumps, shape_name)
+        } else {
+            format!("{}/{}.sql", paths.dumps, shape_name)
+        };
+        let dump_data = if config.compress {
+            fs::read(&dump_filename).context("Failed to read gz dump file")?
+        } else {
+            fs::read(&dump_filename).context("Failed to read dump file")?
+        };
+        let dump_str = String::from_utf8(dump_data).context("Dump file is not valid UTF-8")?;
+        let pool = sqlx::any::AnyPoolOptions::new()
+            .connect(&config.source.connection)
+            .await
+            .context("Failed to connect to source database")?;
+        for stmt in dump_str.split(';') {
+            let stmt = stmt.trim();
+            if !stmt.is_empty() {
+                sqlx::query(stmt).execute(&pool).await?;
+            }
+        }
+        info!("Restored source database from {}", dump_filename);
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let config_paths = ConfigPaths::load_from_file("config.ini")?;
+    let _log_guard = init_logging(&config_paths.logs);
+
+    let cli = Cli::parse();
+    let shape_name = match &cli.command {
+        Commands::Dump { name } => name,
+        Commands::Restore { name } => name,
+        Commands::Run { name } => name,
+    };
+    let shape_file = format!("{}/{}.shape.json", config_paths.shapes, shape_name);
+    let shape_content = fs::read_to_string(&shape_file)
+        .context(format!("Failed to read shape file {}", shape_file))?;
+    let shape: ConfigShape = serde_json::from_str(&shape_content)
+        .context("Failed to parse shape file")?;
+    
+    match &cli.command {
+        Commands::Dump { .. } => {
+            dump_shape(&shape, &config_paths, shape_name).await?;
+        }
+        Commands::Restore { .. } => {
+            restore_shape(&shape, &config_paths, shape_name).await?;
+        }
+        Commands::Run { .. } => {
+            if let Some(mappings) = &shape.mappings {
+                if !mappings.is_empty() {
+                    let migrator = Migrator::new(shape).await?;
+                    migrator.run().await?;
+                } else {
+                    dump_shape(&shape, &config_paths, shape_name).await?;
+                }
+            } else {
+                dump_shape(&shape, &config_paths, shape_name).await?;
+            }
+        }
+    }
+    
     Ok(())
 }
